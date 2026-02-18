@@ -1,1 +1,77 @@
+<!-- index.html -->
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no" />
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>VeinGlow Cam</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <main class="app">
+    <video id="video" playsinline muted autoplay class="hidden"></video>
+    <canvas id="view"></canvas>
+
+    <div id="screenFlash" class="screenFlash hidden"></div>
+
+    <header id="topBar" class="top">
+      <div class="brand">
+        <div class="dot"></div>
+        <div class="txt">
+          <div class="t1">VEINGLOW CAM</div>
+          <div class="t2">DOUBLE EXPOSURE • PHOTO ONLY</div>
+        </div>
+      </div>
+
+      <div class="topRight">
+        <select id="ratio" class="pillSelect" title="Ratio">
+          <option value="auto" selected>AUTO</option>
+          <option value="portrait">PORTRAIT</option>
+          <option value="landscape">LANDSCAPE 16:9</option>
+          <option value="square">SQUARE 1:1</option>
+        </select>
+        <button id="flashBtn" class="pillBtn" type="button">FLASH: OFF</button>
+      </div>
+    </header>
+
+    <section id="hud" class="hud">
+      <div class="row">
+        <button id="openPal" class="btn glass" type="button">
+          PALETTE: <span id="palName">NEON ORGANIC</span>
+        </button>
+        <button id="randomBtn" class="btn glass" type="button">RANDOM</button>
+      </div>
+
+      <div class="row">
+        <button id="hideBtn" class="btn glass" type="button">HIDE</button>
+        <div class="spacer"></div>
+      </div>
+
+      <div class="row snapRow">
+        <button id="snap" class="btn primary snap" type="button">SNAP</button>
+        <button id="showBtn" class="btn glass mini hidden" type="button">SHOW</button>
+      </div>
+
+      <div class="tip" id="tip">
+        Tip: Random changes everything (veins, glow speed, palette, density).
+      </div>
+    </section>
+
+    <!-- Palette Modal -->
+    <div id="palModal" class="modal hidden" aria-hidden="true">
+      <div class="sheet">
+        <div class="sheetTop">
+          <div class="sheetTitle">Choose Palette</div>
+          <button id="closePal" class="btn closeBtn" type="button">CLOSE</button>
+        </div>
+        <div id="palList" class="palList"></div>
+      </div>
+    </div>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
 
