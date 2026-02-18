@@ -1,7 +1,11 @@
-// app.js — VeinGlow Cam (photo-only)
-// Live camera + veiny overlay + white traveling glow runner.
-// No sliders. Random changes everything. 40 palettes. Auto/manual ratios. Flash toggle.
-// Hide -> Show: hides everything except SNAP (and a small SHOW button next to it).
+// app.js — VeinGlow Cam v2 (effect upgrade)
+// Keep UI/camera as-is. Update only visuals:
+// - More biological (eyeball-like) veins: mixed capillary web + feeder veins
+// - Subtle organic motion (breathing/waving)
+// - Runner = soft white orb, clipped INSIDE vein core, respawns on random vein
+// - More embedded double exposure + light palette grade on photo
+// - Moderate grain + bloom on final composite
+// - No sliders. Random changes everything. 40 palettes. Photo-only. Auto/manual ratios. Flash toggle.
 
 const $ = (id) => document.getElementById(id);
 
@@ -48,7 +52,7 @@ const PALETTES = [
   { name:"TOXIC", a:"#a3ff12", b:"#12ffb0", c:"#6d28d9", bg:"#050806" },
   { name:"SUNSET", a:"#f97316", b:"#fb7185", c:"#fbbf24", bg:"#090403" },
   { name:"DEEP SPACE", a:"#60a5fa", b:"#a78bfa", c:"#22d3ee", bg:"#040412" },
-  { name:"VIOLET ICE", a:"#a78bfa", b:"#67e8f9", c:"#f472b6", bg:"#060611" },
+  { name:"VIOLET ICE", a:"#a78bfa", b:"#67e8f9", c:"#f472b6", bg:"#05080b" },
   { name:"GOLD CYAN", a:"#fbbf24", b:"#22d3ee", c:"#fb7185", bg:"#070707" },
   { name:"FOREST NEON", a:"#22c55e", b:"#a3e635", c:"#10b981", bg:"#040704" },
   { name:"ROYAL", a:"#2563eb", b:"#f59e0b", c:"#ef4444", bg:"#05060b" },
@@ -180,7 +184,7 @@ ui.flashBtn.addEventListener("click", async ()=>{
 });
 updateFlashButton();
 
-// ------------------- HUD hide/show -------------------
+// ------------------- HUD hide/show (same behavior you requested) -------------------
 let hudHidden = false;
 function setHudHidden(on){
   hudHidden = !!on;
@@ -214,46 +218,121 @@ function renderPalettes(){
 }
 renderPalettes();
 
-// ------------------- Vein system generation -------------------
+// ------------------- Color helpers -------------------
+function hexToRgb(hex){
+  const h = hex.replace("#","");
+  const n = parseInt(h.length===3 ? h.split("").map(x=>x+x).join("") : h, 16);
+  return { r:(n>>16)&255, g:(n>>8)&255, b:n&255 };
+}
+function rgbStr(c, a=1){
+  return `rgba(${c.r|0},${c.g|0},${c.b|0},${a})`;
+}
+function mixRGB(a,b,t){
+  return { r: lerp(a.r,b.r,t), g: lerp(a.g,b.g,t), b: lerp(a.b,b.b,t) };
+}
+
+// ------------------- Vein system (more biological + motion) -------------------
 const veinCanvas = document.createElement("canvas");
 const veinCtx = veinCanvas.getContext("2d", { willReadFrequently: true });
 
-let veins = []; // array of polylines: [{pts:[{x,y}...], w}]
-let runner = { lineIndex:0, t:0, speed:0.22 };
+// masks for core clipping + glow layering
+const coreMask = document.createElement("canvas");
+const coreCtx = coreMask.getContext("2d", { willReadFrequently: true });
+
+const runnerCanvas = document.createElement("canvas");
+const runnerCtx = runnerCanvas.getContext("2d", { willReadFrequently: true });
+
+// mild bloom helper
+const bloomSmall = document.createElement("canvas");
+const bloomCtx = bloomSmall.getContext("2d", { willReadFrequently: true });
+
+// grain helper
+const grainCanvas = document.createElement("canvas");
+const grainCtx = grainCanvas.getContext("2d", { willReadFrequently: true });
+
+let veins = []; // each: { basePts:[{x,y,t,wob}], pts:[{x,y}], w, kind:"cap"/"feed" }
+let runner = { lineIndex:0, t:0, speed:0.22, radius:12 };
+
 let params = {
-  density: 22,     // number of main branches
-  thickness: 1.9,  // base thickness in px (normalized later)
-  jitter: 0.030,
-  wander: 0.035,
-  detail: 7,       // subdivision steps
+  // 1B mixed capillary + feeders
+  capCount: 38,
+  feedCount: 6,
+
+  // 2C blood tint
+  bloodMix: 0.45, // palette->blood mix
+
+  // 3B subtle wave motion
+  waveAmp: 0.010,
+  waveSpeed: 0.55,
+
+  // base thickness scaling
+  capThickness: 1.15,
+  feedThickness: 2.65,
+
+  // shape
+  jitter: 0.018,
+  wander: 0.028,
+  detail: 9,
   scale: 1.0,
-  glowStrength: 1.0,
-  overlayAlpha: 0.82, // veins-forward double exposure
-  blend: "screen", // overlay style
+
+  // runner
+  glowStrength: 1.10,
+  overlayAlpha: 0.70,     // more embedded than before
+  blend: "screen",        // double exposure feel
+  photoTint: 0.16,        // 8B light palette cast on photo
+  photoTintMode: "soft-light", // tint blending
+
+  // 9C moderate grain + bloom
+  grain: 0.09,
+  bloom: 0.14,
 };
 
-function genPolyline(seedX, seedY, dirX, dirY, steps){
+function ensureAuxCanvases(){
+  const w = Math.max(420, Math.floor(view.width / 2));
+  const h = Math.max(420, Math.floor(view.height / 2));
+
+  if (veinCanvas.width !== w || veinCanvas.height !== h){
+    veinCanvas.width = w; veinCanvas.height = h;
+    coreMask.width = w; coreMask.height = h;
+    runnerCanvas.width = w; runnerCanvas.height = h;
+  }
+
+  // bloom working canvas
+  const bw = Math.max(260, Math.floor(view.width / 5));
+  const bh = Math.max(260, Math.floor(view.height / 5));
+  if (bloomSmall.width !== bw || bloomSmall.height !== bh){
+    bloomSmall.width = bw; bloomSmall.height = bh;
+  }
+
+  // grain matches view for simplicity (cheap + fast)
+  if (grainCanvas.width !== view.width || grainCanvas.height !== view.height){
+    grainCanvas.width = view.width; grainCanvas.height = view.height;
+  }
+}
+
+// organic polyline generator (biological: curvier + branching)
+function genPolyline(seedX, seedY, dirX, dirY, steps, kind){
   let x = seedX, y = seedY;
   let dx = dirX, dy = dirY;
-  const pts = [{x,y}];
+  const basePts = [{ x, y, wob: Math.random()*10, w: 1 }];
 
   for (let i=0;i<steps;i++){
-    // gentle direction wander
+    // gentler wander = more biological
     const ang = (Math.random()-0.5) * params.wander * Math.PI * 2;
     const ca = Math.cos(ang), sa = Math.sin(ang);
     const ndx = dx*ca - dy*sa;
     const ndy = dx*sa + dy*ca;
     dx = ndx; dy = ndy;
 
-    // move forward with slight jitter
-    const step = rand(0.035, 0.070);
+    // forward step + jitter
+    const step = rand(0.030, 0.060) * (kind === "feed" ? 1.10 : 1.00);
     x += dx*step + (Math.random()-0.5)*params.jitter;
     y += dy*step + (Math.random()-0.5)*params.jitter;
 
-    // keep inside bounds by nudging toward center
+    // softly pull toward center so networks overlap (eyeball-ish)
     const cx = 0.5 - x;
     const cy = 0.5 - y;
-    const pull = 0.02;
+    const pull = kind === "feed" ? 0.020 : 0.030;
     dx += cx*pull;
     dy += cy*pull;
 
@@ -261,96 +340,182 @@ function genPolyline(seedX, seedY, dirX, dirY, steps){
     const m = Math.hypot(dx,dy) || 1;
     dx /= m; dy /= m;
 
-    // clamp in [0..1] softly
-    x = clamp(x, 0.02, 0.98);
-    y = clamp(y, 0.02, 0.98);
+    // clamp inside bounds
+    x = clamp(x, 0.01, 0.99);
+    y = clamp(y, 0.01, 0.99);
 
-    pts.push({x,y});
+    // thickness taper
+    const taper = lerp(1.0, 0.65, i / (steps-1));
+    basePts.push({ x, y, wob: Math.random()*10, w: taper });
 
-    // occasional micro-branching (organic)
-    if (i > 2 && i < steps-2 && Math.random() < 0.14){
-      const bAng = (Math.random()<0.5 ? -1 : 1) * rand(0.35, 0.95);
+    // capillary branching is more frequent than feeder branching
+    const branchChance = kind === "cap" ? 0.20 : 0.10;
+    if (i > 3 && i < steps-3 && Math.random() < branchChance){
+      const bAng = (Math.random()<0.5 ? -1 : 1) * rand(0.40, 1.05);
       const bdx = dx*Math.cos(bAng) - dy*Math.sin(bAng);
       const bdy = dx*Math.sin(bAng) + dy*Math.cos(bAng);
-      const branchSteps = Math.floor(steps * rand(0.25, 0.55));
-      const branch = genPolyline(x, y, bdx, bdy, branchSteps);
-      // thinner branch
+      const branchSteps = Math.floor(steps * rand(0.22, 0.50));
+      const branch = genPolyline(x, y, bdx, bdy, branchSteps, "cap");
       branch.w *= rand(0.45, 0.70);
       veins.push(branch);
     }
   }
 
-  return { pts, w: rand(0.9, 1.25) };
+  return { basePts, pts: basePts.map(p=>({x:p.x,y:p.y})), w: 1.0, kind };
 }
 
 function regenerateVeins(forcePaletteChange=true){
-  // Randomize everything
   if (forcePaletteChange){
     currentPal = pick(PALETTES);
     ui.palName.textContent = currentPal.name;
   }
 
-  params.density = Math.floor(rand(14, 42));          // amount of veins
-  params.thickness = rand(1.2, 3.1);                 // thickness
-  params.jitter = rand(0.010, 0.050);
-  params.wander = rand(0.018, 0.050);
-  params.detail = Math.floor(rand(6, 10));
-  params.scale = rand(0.85, 1.18);
-  params.glowStrength = rand(0.9, 1.45);
-  params.overlayAlpha = rand(0.78, 0.90);
-  params.blend = pick(["screen","lighter","overlay"]); // believable double exposure styles
+  // Random changes EVERYTHING (10A)
+  params.capCount = Math.floor(rand(28, 60));
+  params.feedCount = Math.floor(rand(4, 10));
+
+  params.bloodMix = rand(0.35, 0.55);
+  params.waveAmp = rand(0.006, 0.014);     // subtle organic motion (3B)
+  params.waveSpeed = rand(0.42, 0.72);
+
+  params.capThickness = rand(0.95, 1.45);
+  params.feedThickness = rand(2.25, 3.35);
+
+  params.jitter = rand(0.010, 0.024);
+  params.wander = rand(0.020, 0.038);
+  params.detail = Math.floor(rand(8, 11));
+  params.scale = rand(0.92, 1.12);
+
+  params.glowStrength = rand(0.95, 1.25);
+
+  params.overlayAlpha = rand(0.62, 0.78);     // more embedded (7B)
+  params.blend = pick(["screen","overlay","soft-light"]);
+  params.photoTint = rand(0.12, 0.22);         // 8B light photo tint
+  params.photoTintMode = pick(["soft-light","overlay","color"]);
+
+  params.grain = rand(0.07, 0.11);             // 9C moderate grain
+  params.bloom = rand(0.12, 0.18);             // 9C moderate bloom
 
   veins = [];
 
-  // Generate main branches from random edge points toward center
-  for (let i=0;i<params.density;i++){
+  // feeders: start from edges, longer lines
+  for (let i=0;i<params.feedCount;i++){
     const side = (Math.random()*4)|0;
     let x,y, dx,dy;
-    if (side===0){ x = rand(0.05,0.95); y = 0.02; dx = rand(-0.2,0.2); dy = 1; }
-    if (side===1){ x = rand(0.05,0.95); y = 0.98; dx = rand(-0.2,0.2); dy = -1; }
-    if (side===2){ x = 0.02; y = rand(0.05,0.95); dx = 1; dy = rand(-0.2,0.2); }
-    if (side===3){ x = 0.98; y = rand(0.05,0.95); dx = -1; dy = rand(-0.2,0.2); }
+    if (side===0){ x = rand(0.05,0.95); y = 0.01; dx = rand(-0.15,0.15); dy = 1; }
+    if (side===1){ x = rand(0.05,0.95); y = 0.99; dx = rand(-0.15,0.15); dy = -1; }
+    if (side===2){ x = 0.01; y = rand(0.05,0.95); dx = 1; dy = rand(-0.15,0.15); }
+    if (side===3){ x = 0.99; y = rand(0.05,0.95); dx = -1; dy = rand(-0.15,0.15); }
 
-    const steps = Math.floor(rand(10, 18)) + params.detail;
+    const steps = Math.floor(rand(14, 22)) + params.detail;
     const m = Math.hypot(dx,dy) || 1; dx/=m; dy/=m;
 
-    const line = genPolyline(x,y,dx,dy,steps);
-    line.w *= rand(0.8, 1.3);
+    const line = genPolyline(x,y,dx,dy,steps,"feed");
+    line.w *= rand(1.05, 1.35);
     veins.push(line);
   }
 
-  // runner path: pick a longer line
-  let best = 0, bestLen = 0;
-  for (let i=0;i<veins.length;i++){
-    const L = veins[i].pts.length;
-    if (L > bestLen){ bestLen = L; best = i; }
+  // capillaries: seed from random feeder points + random interior points
+  const seedFromExisting = () => {
+    const src = pick(veins);
+    const bp = pick(src.basePts);
+    return { x: bp.x, y: bp.y };
+  };
+
+  for (let i=0;i<params.capCount;i++){
+    let x,y;
+    if (Math.random() < 0.70 && veins.length){
+      const s = seedFromExisting();
+      x = s.x; y = s.y;
+    } else {
+      x = rand(0.10,0.90);
+      y = rand(0.10,0.90);
+    }
+
+    // direction loosely radial
+    let dx = (0.5 - x) * rand(-0.8, 0.8);
+    let dy = (0.5 - y) * rand(-0.8, 0.8);
+    if (Math.abs(dx)+Math.abs(dy) < 0.02){ dx = rand(-1,1); dy = rand(-1,1); }
+    const m = Math.hypot(dx,dy) || 1; dx/=m; dy/=m;
+
+    const steps = Math.floor(rand(9, 16)) + params.detail;
+    const line = genPolyline(x,y,dx,dy,steps,"cap");
+    line.w *= rand(0.70, 1.05);
+    veins.push(line);
   }
-  runner.lineIndex = best;
+
+  // pick runner starting vein randomly (5A respawn behavior will handle switching)
+  runner.lineIndex = (Math.random()*veins.length)|0;
   runner.t = Math.random();
-  runner.speed = rand(0.10, 0.38); // speed of glow travel
+  runner.speed = rand(0.12, 0.42);
+  runner.radius = rand(9, 16); // soft orb radius (4A)
 }
 
-// ------------------- Drawing helpers -------------------
-function fitCanvas(){
-  const { vw, vh } = viewportSize();
-  const dpr = Math.min(2, window.devicePixelRatio || 1);
-  view.width = Math.floor(vw * dpr);
-  view.height = Math.floor(vh * dpr);
-}
-fitCanvas();
-window.addEventListener("resize", fitCanvas);
-window.visualViewport?.addEventListener("resize", fitCanvas);
+// ------------------- Motion deformation (3B) -------------------
+function deformVeinPoints(time){
+  // subtle sine-based wobble per point, coherent along the line
+  const amp = params.waveAmp;
+  const spd = params.waveSpeed;
 
-function ensureVeinCanvas(){
-  // Render veins at a lower resolution for speed, then upscale
-  const w = Math.max(420, Math.floor(view.width / 2));
-  const h = Math.max(420, Math.floor(view.height / 2));
-  if (veinCanvas.width !== w || veinCanvas.height !== h){
-    veinCanvas.width = w;
-    veinCanvas.height = h;
+  for (const line of veins){
+    const bp = line.basePts;
+    const out = line.pts;
+    for (let i=0;i<bp.length;i++){
+      const p = bp[i];
+      // combine two low-frequency waves for “breathing”
+      const t = time*spd;
+      const wob = p.wob;
+      const w1 = Math.sin(t + wob + i*0.35);
+      const w2 = Math.sin(t*0.62 + wob*1.7 + i*0.18);
+
+      // direction for perpendicular offset: use neighbor tangent
+      const a = bp[Math.max(0,i-1)];
+      const b = bp[Math.min(bp.length-1,i+1)];
+      let tx = b.x - a.x;
+      let ty = b.y - a.y;
+      const m = Math.hypot(tx,ty) || 1;
+      tx /= m; ty /= m;
+
+      // perpendicular
+      const px = -ty, py = tx;
+
+      // taper motion a bit at ends
+      const taper = Math.sin((i/(bp.length-1))*Math.PI);
+      const o = (w1*0.65 + w2*0.35) * amp * taper;
+
+      out[i].x = clamp(p.x + px*o, 0.0, 1.0);
+      out[i].y = clamp(p.y + py*o, 0.0, 1.0);
+    }
   }
 }
 
+// ------------------- Path helpers for runner -------------------
+function polyLength(pts){
+  let L=0;
+  for (let i=1;i<pts.length;i++){
+    const dx = pts[i].x - pts[i-1].x;
+    const dy = pts[i].y - pts[i-1].y;
+    L += Math.hypot(dx,dy);
+  }
+  return L || 1;
+}
+function pointAlong(pts, t){
+  const total = polyLength(pts);
+  let target = total * clamp(t,0,1);
+  for (let i=1;i<pts.length;i++){
+    const a = pts[i-1], b = pts[i];
+    const seg = Math.hypot(b.x-a.x, b.y-a.y);
+    if (target <= seg){
+      const u = seg ? (target/seg) : 0;
+      return { x: lerp(a.x,b.x,u), y: lerp(a.y,b.y,u) };
+    }
+    target -= seg;
+  }
+  const last = pts[pts.length-1];
+  return { x:last.x, y:last.y };
+}
+
+// ------------------- Draw video (cropped to chosen ratio) -------------------
 function drawVideoTo(ctx, dstW, dstH){
   if (!video.videoWidth || !video.videoHeight) return;
 
@@ -363,98 +528,164 @@ function drawVideoTo(ctx, dstW, dstH){
   ctx.drawImage(video, cx, cy, cropW, cropH, 0, 0, dstW, dstH);
 }
 
-function hexToRgb(hex){
-  const h = hex.replace("#","");
-  const n = parseInt(h.length===3 ? h.split("").map(x=>x+x).join("") : h, 16);
-  return { r:(n>>16)&255, g:(n>>8)&255, b:n&255 };
-}
-function mix(a,b,t){
-  return {
-    r: Math.round(lerp(a.r,b.r,t)),
-    g: Math.round(lerp(a.g,b.g,t)),
-    b: Math.round(lerp(a.b,b.b,t)),
-  };
-}
-function rgbStr(c, a=1){
-  return `rgba(${c.r},${c.g},${c.b},${a})`;
-}
+// ------------------- Composite: more embedded double exposure (7B/8B/9C) -------------------
+function addBloom(ctx, w, h, strength){
+  if (strength <= 0) return;
 
-function polyLength(pts){
-  let L=0;
-  for (let i=1;i<pts.length;i++){
-    const dx = pts[i].x - pts[i-1].x;
-    const dy = pts[i].y - pts[i-1].y;
-    L += Math.hypot(dx,dy);
+  // downsample, blur-ish via repeated draws, then screen back
+  const bw = bloomSmall.width, bh = bloomSmall.height;
+  bloomCtx.clearRect(0,0,bw,bh);
+  bloomCtx.drawImage(ctx.canvas, 0,0,w,h, 0,0,bw,bh);
+
+  bloomCtx.globalCompositeOperation = "source-over";
+  bloomCtx.globalAlpha = 0.25;
+  for (let i=0;i<5;i++){
+    bloomCtx.drawImage(bloomSmall, -2, 0);
+    bloomCtx.drawImage(bloomSmall,  2, 0);
+    bloomCtx.drawImage(bloomSmall, 0, -2);
+    bloomCtx.drawImage(bloomSmall, 0,  2);
   }
-  return L || 1;
+  bloomCtx.globalAlpha = 1;
+
+  ctx.save();
+  ctx.globalCompositeOperation = "screen";
+  ctx.globalAlpha = strength;
+  ctx.drawImage(bloomSmall, 0,0,bw,bh, 0,0,w,h);
+  ctx.restore();
 }
-function pointAlong(pts, t){
-  // t in [0..1]
-  const total = polyLength(pts);
-  let target = total * clamp(t,0,1);
-  for (let i=1;i<pts.length;i++){
-    const a = pts[i-1], b = pts[i];
-    const seg = Math.hypot(b.x-a.x, b.y-a.y);
-    if (target <= seg){
-      const u = seg ? (target/seg) : 0;
-      return { x: lerp(a.x,b.x,u), y: lerp(a.y,b.y,u), i };
-    }
-    target -= seg;
+
+function addGrain(ctx, w, h, amount){
+  if (amount <= 0) return;
+
+  const img = grainCtx.createImageData(w, h);
+  const d = img.data;
+  // cheap monochrome grain
+  for (let i=0;i<d.length;i+=4){
+    const n = (Math.random() - 0.5) * 255;
+    const v = clamp(128 + n, 0, 255);
+    d[i]=v; d[i+1]=v; d[i+2]=v; d[i+3]=255;
   }
-  return { x: pts[pts.length-1].x, y: pts[pts.length-1].y, i: pts.length-1 };
+  grainCtx.putImageData(img,0,0);
+
+  ctx.save();
+  ctx.globalCompositeOperation = "overlay";
+  ctx.globalAlpha = amount;
+  ctx.drawImage(grainCanvas, 0,0,w,h);
+  ctx.restore();
 }
 
-function drawVeins(){
-  ensureVeinCanvas();
-  const w = veinCanvas.width, h = veinCanvas.height;
-  veinCtx.clearRect(0,0,w,h);
-
-  // subtle background tint layer (helps double exposure feel)
-  const bg = hexToRgb(currentPal.bg);
-  veinCtx.fillStyle = rgbStr(bg, 0.06);
-  veinCtx.fillRect(0,0,w,h);
-
-  // choose vein colors per palette (veins use palette; runner always white)
+function tintPhoto(ctx, w, h){
+  // light palette cast on photo (8B), integrated (7B)
   const ca = hexToRgb(currentPal.a);
   const cb = hexToRgb(currentPal.b);
   const cc = hexToRgb(currentPal.c);
+  const mix1 = mixRGB(ca, cb, 0.50);
+  const mix2 = mixRGB(mix1, cc, 0.35);
 
-  // draw base veins
+  ctx.save();
+  ctx.globalCompositeOperation = params.photoTintMode;
+  ctx.globalAlpha = params.photoTint;
+
+  // soft gradient tint
+  const g = ctx.createLinearGradient(0,0,w,h);
+  g.addColorStop(0, rgbStr(mix2, 1));
+  g.addColorStop(1, rgbStr(ca, 1));
+  ctx.fillStyle = g;
+  ctx.fillRect(0,0,w,h);
+
+  ctx.restore();
+}
+
+// ------------------- Vein drawing (core mask + color + runner clipped inside) -------------------
+function drawVeins(time){
+  ensureAuxCanvases();
+  deformVeinPoints(time);
+
+  const w = veinCanvas.width, h = veinCanvas.height;
+
+  veinCtx.clearRect(0,0,w,h);
+  coreCtx.clearRect(0,0,w,h);
+  runnerCtx.clearRect(0,0,w,h);
+
+  // Colors: palette-based veins with blood tint in core (2C)
+  const ca = hexToRgb(currentPal.a);
+  const cb = hexToRgb(currentPal.b);
+  const cc = hexToRgb(currentPal.c);
+  const blood = { r: 210, g: 45, b: 60 };
+
+  const coreA = mixRGB(ca, blood, params.bloodMix);
+  const coreB = mixRGB(cb, blood, params.bloodMix);
+  const coreC = mixRGB(cc, blood, params.bloodMix);
+
+  // thickness scaling
+  const baseScale = (w/760) * params.scale;
+  const capW = params.capThickness * baseScale;
+  const feedW = params.feedThickness * baseScale;
+
+  // 1) draw core mask (for clipping runner inside vein core)
+  coreCtx.save();
+  coreCtx.globalCompositeOperation = "source-over";
+  coreCtx.strokeStyle = "rgba(255,255,255,1)";
+  coreCtx.lineCap = "round";
+  coreCtx.lineJoin = "round";
+
+  for (let k=0;k<veins.length;k++){
+    const line = veins[k];
+    const pts = line.pts;
+    const lw = (line.kind === "feed" ? feedW : capW) * line.w;
+
+    coreCtx.lineWidth = lw;
+    coreCtx.beginPath();
+    coreCtx.moveTo(pts[0].x*w, pts[0].y*h);
+    for (let i=1;i<pts.length;i++) coreCtx.lineTo(pts[i].x*w, pts[i].y*h);
+    coreCtx.stroke();
+  }
+  coreCtx.restore();
+
+  // 2) draw vein glow + colored core (more biological depth)
   veinCtx.save();
   veinCtx.globalCompositeOperation = "source-over";
   veinCtx.lineCap = "round";
   veinCtx.lineJoin = "round";
 
-  const baseW = params.thickness * (w/720) * params.scale;
-
   for (let k=0;k<veins.length;k++){
     const line = veins[k];
     const pts = line.pts;
 
-    // alternate colors to create more “alive” branching
-    const tcol = (k % 3) / 2; // 0, .5, 1
-    const col = tcol===0 ? ca : (tcol===0.5 ? cb : cc);
+    // color cycling
+    const which = k % 3;
+    const glowCol = which===0 ? ca : which===1 ? cb : cc;
+    const coreCol = which===0 ? coreA : which===1 ? coreB : coreC;
 
-    // multi-pass for glow/bloom
-    // outer glow
-    veinCtx.strokeStyle = rgbStr(col, 0.18 * params.glowStrength);
-    veinCtx.lineWidth = baseW * line.w * 3.8;
+    const lw = (line.kind === "feed" ? feedW : capW) * line.w;
+
+    // outer haze (subtle)
+    veinCtx.strokeStyle = rgbStr(glowCol, 0.12 * params.glowStrength);
+    veinCtx.lineWidth = lw * 4.4;
     veinCtx.beginPath();
     veinCtx.moveTo(pts[0].x*w, pts[0].y*h);
     for (let i=1;i<pts.length;i++) veinCtx.lineTo(pts[i].x*w, pts[i].y*h);
     veinCtx.stroke();
 
     // mid glow
-    veinCtx.strokeStyle = rgbStr(col, 0.28 * params.glowStrength);
-    veinCtx.lineWidth = baseW * line.w * 2.2;
+    veinCtx.strokeStyle = rgbStr(glowCol, 0.22 * params.glowStrength);
+    veinCtx.lineWidth = lw * 2.6;
     veinCtx.beginPath();
     veinCtx.moveTo(pts[0].x*w, pts[0].y*h);
     for (let i=1;i<pts.length;i++) veinCtx.lineTo(pts[i].x*w, pts[i].y*h);
     veinCtx.stroke();
 
-    // core vein
-    veinCtx.strokeStyle = rgbStr(col, 0.65);
-    veinCtx.lineWidth = baseW * line.w * 1.0;
+    // colored core (blood-tinted)
+    veinCtx.strokeStyle = rgbStr(coreCol, 0.72);
+    veinCtx.lineWidth = lw * 1.05;
+    veinCtx.beginPath();
+    veinCtx.moveTo(pts[0].x*w, pts[0].y*h);
+    for (let i=1;i<pts.length;i++) veinCtx.lineTo(pts[i].x*w, pts[i].y*h);
+    veinCtx.stroke();
+
+    // tiny spec highlight (helps “wet” biological feel)
+    veinCtx.strokeStyle = "rgba(255,255,255,0.08)";
+    veinCtx.lineWidth = lw * 0.55;
     veinCtx.beginPath();
     veinCtx.moveTo(pts[0].x*w, pts[0].y*h);
     for (let i=1;i<pts.length;i++) veinCtx.lineTo(pts[i].x*w, pts[i].y*h);
@@ -463,107 +694,125 @@ function drawVeins(){
 
   veinCtx.restore();
 
-  // draw the WHITE traveling runner pulse on one line
+  // 3) runner: soft WHITE orb clipped INSIDE core mask (6B) + respawn (5A)
   const idx = clamp(runner.lineIndex, 0, veins.length-1);
-  const pts = veins[idx]?.pts;
-  if (pts && pts.length > 2){
-    // move runner forward
+  const line = veins[idx];
+  if (line && line.pts.length > 2){
     runner.t += (runner.speed / 60);
     if (runner.t > 1.0){
+      // exit -> respawn on another random vein (5A)
       runner.t = runner.t - 1.0;
-      runner.lineIndex = (Math.random() < 0.6) ? ((Math.random()*veins.length)|0) : runner.lineIndex;
-      runner.speed = rand(0.10, 0.38);
+      runner.lineIndex = (Math.random()*veins.length)|0;
+      runner.speed = rand(0.12, 0.42);
+      runner.radius = rand(9, 16);
     }
 
-    const head = pointAlong(pts, runner.t);
-    const tailT = clamp(runner.t - 0.12, 0, 1);
-    const tail = pointAlong(pts, tailT);
+    const head = pointAlong(line.pts, runner.t);
+    const x = head.x*w, y = head.y*h;
 
-    // draw runner segment (tail->head) with soft white bloom
+    // draw orb on runner canvas
+    runnerCtx.save();
+    runnerCtx.globalCompositeOperation = "source-over";
+
+    // orb bloom gradient
+    const r = runner.radius * (w/760) * params.scale;
+    const g = runnerCtx.createRadialGradient(x,y, r*0.05, x,y, r*2.0);
+    g.addColorStop(0.00, "rgba(255,255,255,0.95)");
+    g.addColorStop(0.20, "rgba(255,255,255,0.55)");
+    g.addColorStop(0.55, "rgba(255,255,255,0.16)");
+    g.addColorStop(1.00, "rgba(255,255,255,0.00)");
+
+    runnerCtx.fillStyle = g;
+    runnerCtx.beginPath();
+    runnerCtx.arc(x,y, r*2.0, 0, Math.PI*2);
+    runnerCtx.fill();
+
+    // tighter bright core
+    const g2 = runnerCtx.createRadialGradient(x,y, 0, x,y, r*0.70);
+    g2.addColorStop(0.00, "rgba(255,255,255,0.98)");
+    g2.addColorStop(1.00, "rgba(255,255,255,0.00)");
+    runnerCtx.fillStyle = g2;
+    runnerCtx.beginPath();
+    runnerCtx.arc(x,y, r*0.85, 0, Math.PI*2);
+    runnerCtx.fill();
+
+    runnerCtx.restore();
+
+    // clip orb inside the vein core mask
+    runnerCtx.save();
+    runnerCtx.globalCompositeOperation = "destination-in";
+    runnerCtx.drawImage(coreMask, 0,0);
+    runnerCtx.restore();
+
+    // add runner into veins with lighter blend
     veinCtx.save();
     veinCtx.globalCompositeOperation = "lighter";
-    veinCtx.lineCap = "round";
-    veinCtx.lineJoin = "round";
-
-    // multiple passes = bloom
-    const coreW = baseW * 1.3;
-    const glowW1 = coreW * 4.2;
-    const glowW2 = coreW * 2.6;
-
-    // outer glow
-    veinCtx.strokeStyle = "rgba(255,255,255,0.14)";
-    veinCtx.lineWidth = glowW1;
-    veinCtx.beginPath();
-    veinCtx.moveTo(tail.x*w, tail.y*h);
-    veinCtx.lineTo(head.x*w, head.y*h);
-    veinCtx.stroke();
-
-    // inner glow
-    veinCtx.strokeStyle = "rgba(255,255,255,0.26)";
-    veinCtx.lineWidth = glowW2;
-    veinCtx.beginPath();
-    veinCtx.moveTo(tail.x*w, tail.y*h);
-    veinCtx.lineTo(head.x*w, head.y*h);
-    veinCtx.stroke();
-
-    // core
-    veinCtx.strokeStyle = "rgba(255,255,255,0.95)";
-    veinCtx.lineWidth = coreW;
-    veinCtx.beginPath();
-    veinCtx.moveTo(tail.x*w, tail.y*h);
-    veinCtx.lineTo(head.x*w, head.y*h);
-    veinCtx.stroke();
-
-    // hot “head”
-    veinCtx.fillStyle = "rgba(255,255,255,0.9)";
-    veinCtx.beginPath();
-    veinCtx.arc(head.x*w, head.y*h, coreW*1.05, 0, Math.PI*2);
-    veinCtx.fill();
-
+    veinCtx.globalAlpha = 0.95;
+    veinCtx.drawImage(runnerCanvas, 0,0);
     veinCtx.restore();
   }
 }
 
 // ------------------- Composition (live view) -------------------
-function fitExportAndComposite(ctx, outW, outH){
+function compositeTo(ctx, outW, outH, time){
   // draw camera
   drawVideoTo(ctx, outW, outH);
 
-  // overlay veins (double exposure style)
+  // add light palette photo tint (8B) to embed effect
+  tintPhoto(ctx, outW, outH);
+
+  // draw veins over photo with embedded double exposure feel (7B)
+  // upscale veins to output
   ctx.save();
   ctx.globalAlpha = params.overlayAlpha;
   ctx.globalCompositeOperation = params.blend;
-
-  // scale vein canvas to output
-  ctx.drawImage(veinCanvas, 0, 0, outW, outH);
-
-  // add a second faint pass for “exposure” feel
-  ctx.globalAlpha = params.overlayAlpha * 0.35;
-  ctx.globalCompositeOperation = "lighter";
-  ctx.drawImage(veinCanvas, 0, 0, outW, outH);
-
+  ctx.drawImage(veinCanvas, 0,0, outW, outH);
   ctx.restore();
+
+  // extra soft pass to feel “exposed into” the image (double exposure fade)
+  ctx.save();
+  ctx.globalAlpha = params.overlayAlpha * 0.22;
+  ctx.globalCompositeOperation = "screen";
+  ctx.drawImage(veinCanvas, 0,0, outW, outH);
+  ctx.restore();
+
+  // bloom + grain on final composite (9C)
+  addBloom(ctx, outW, outH, params.bloom);
+  addGrain(ctx, outW, outH, params.grain);
 }
 
-function tick(){
+// ------------------- Live loop -------------------
+function fitCanvas(){
+  const { vw, vh } = viewportSize();
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  view.width = Math.floor(vw * dpr);
+  view.height = Math.floor(vh * dpr);
+}
+fitCanvas();
+window.addEventListener("resize", fitCanvas);
+window.visualViewport?.addEventListener("resize", fitCanvas);
+
+let t0 = performance.now();
+function tick(now){
   if (!video.videoWidth || !video.videoHeight){
     requestAnimationFrame(tick);
     return;
   }
 
-  // update veins animation
-  drawVeins();
+  const time = (now - t0) / 1000;
 
-  // draw composed live view
+  ensureAuxCanvases();
+  drawVeins(time);
+
   vctx.setTransform(1,0,0,1,0,0);
   vctx.clearRect(0,0,view.width,view.height);
 
-  // background tint (palette bg)
+  // fill background in case camera edges appear
   const bg = hexToRgb(currentPal.bg);
   vctx.fillStyle = rgbStr(bg, 1);
   vctx.fillRect(0,0,view.width,view.height);
 
-  fitExportAndComposite(vctx, view.width, view.height);
+  compositeTo(vctx, view.width, view.height, time);
 
   requestAnimationFrame(tick);
 }
@@ -594,11 +843,11 @@ ui.snap.addEventListener("click", async ()=>{
   exportCanvas.width = out.w;
   exportCanvas.height = out.h;
 
-  // Ensure vein canvas exists; draw one more frame so snap matches view
-  ensureVeinCanvas();
-  drawVeins();
+  // render one more “exact” frame for export
+  const time = (performance.now() - t0) / 1000;
+  ensureAuxCanvases();
+  drawVeins(time);
 
-  // composite into export size
   exportCtx.setTransform(1,0,0,1,0,0);
   exportCtx.clearRect(0,0,out.w,out.h);
 
@@ -607,7 +856,7 @@ ui.snap.addEventListener("click", async ()=>{
   exportCtx.fillStyle = rgbStr(bg, 1);
   exportCtx.fillRect(0,0,out.w,out.h);
 
-  fitExportAndComposite(exportCtx, out.w, out.h);
+  compositeTo(exportCtx, out.w, out.h, time);
 
   // download jpg
   const a = document.createElement("a");
@@ -649,9 +898,8 @@ async function startCamera(){
       ? "Ready. Torch supported."
       : "Ready. Torch not supported (screen flash works).";
 
-    // initial seed
     regenerateVeins(false);
-    tick();
+    requestAnimationFrame(tick);
   }catch(e){
     ui.tip.textContent = "Camera blocked. Use HTTPS + allow Camera in Safari.";
   }
@@ -659,4 +907,3 @@ async function startCamera(){
 
 // init
 startCamera();
-
